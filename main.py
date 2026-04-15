@@ -1,8 +1,13 @@
 import sys
 import os
+import json
+import winreg
 import random
 import datetime
 from PyQt5.QtGui import QIcon, QMovie, QCursor, QPixmap
+
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'state.json')
+APP_NAME = 'MalteseDesktopPet'
 from PyQt5.QtWidgets import (QWidget, QApplication, QSystemTrayIcon, 
                              QMenu, QAction, QLabel, QDesktopWidget,
                              QProgressBar, QVBoxLayout, QHBoxLayout,
@@ -53,11 +58,16 @@ class DesktopPet(QWidget):
         self.resurrect_timer = QTimer(self)
         self.resurrect_timer.setSingleShot(True)
         self.resurrect_timer.timeout.connect(self.resurrectPet)
-        self.is_dead = False
+        loaded = self.load_state()
+        self._init_happiness, self._init_energy, self._init_is_dead, self._init_resurrect_ms, self._init_stats_visible = loaded
+        self.is_dead = self._init_is_dead
         self.hour_timer = QTimer(self)
         self.hour_timer.timeout.connect(self.hourAlert)
         self.hour_timer.start(1000)
         self.last_hour = -1
+        self.save_timer = QTimer(self)
+        self.save_timer.timeout.connect(self.save_state)
+        self.save_timer.start(5 * 60 * 1000)
         self.initPetImage()
         
     def init(self):
@@ -73,10 +83,39 @@ class DesktopPet(QWidget):
         self.hideup = QAction(u'隐藏', self, triggered=self.hide)
         self.hidestats = QAction(u'显示/隐藏状态栏', self, triggered=self.hideStatsBar)
         self.tray_icon_menu = QMenu(self)
+        self.tray_icon_menu.setStyleSheet("""
+            QMenu {
+                background-color: #FFFAF9;
+                border: 1.5px solid #FF69B4;
+                padding: 5px 3px;
+                font-family: "幼圆", "YouYuan", "Microsoft YaHei";
+                font-size: 13px;
+                color: #555555;
+            }
+            QMenu::item {
+                padding: 6px 22px 6px 14px;
+                border-radius: 6px;
+                margin: 2px 4px;
+            }
+            QMenu::item:selected {
+                background-color: #FFE2DE;
+                color: #FF69B4;
+            }
+            QMenu::separator {
+                height: 1px;
+                background-color: #FFD6E7;
+                margin: 4px 8px;
+            }
+        """)
+        self.autostart_action = QAction(u'开机自启动', self)
+        self.autostart_action.setCheckable(True)
+        self.autostart_action.setChecked(self.is_autostart_enabled())
+        self.autostart_action.triggered.connect(self.toggleAutostart)
         self.tray_icon_menu.addAction(self.quit_action)
         self.tray_icon_menu.addAction(self.showing)
         self.tray_icon_menu.addAction(self.hideup)
         self.tray_icon_menu.addAction(self.hidestats)
+        self.tray_icon_menu.addAction(self.autostart_action)
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setIcon(QIcon(icons))
         self.tray_icon.setContextMenu(self.tray_icon_menu)
@@ -100,20 +139,28 @@ class DesktopPet(QWidget):
         self.happiness_layout.addWidget(self.happiness_icon, alignment=Qt.AlignCenter)
         self.happiness_bar = QProgressBar()
         self.happiness_bar.setRange(0, 100)
-        self.happiness_bar.setValue(80)
-        self.happiness_bar.setFixedHeight(12)
+        self.happiness_bar.setValue(self._init_happiness)
+        self.happiness_bar.setTextVisible(False)
+        self.happiness_bar.setFixedHeight(16)
         self.happiness_bar.setFixedWidth(150)
         self.happiness_bar.setStyleSheet("""
             QProgressBar {
                 border: 1px solid #ccc;
-                border-radius: 5px;
-                text-align: center;
+                border-radius: 8px;
             }
             QProgressBar::chunk {
                 background-color: #FF69B4;
+                border-radius: 8px;
             }
         """)
         self.happiness_layout.addWidget(self.happiness_bar, alignment=Qt.AlignCenter)
+        self.happiness_pct_label = QLabel(f"{self._init_happiness}%")
+        self.happiness_pct_label.setStyleSheet("""
+            font-family: "幼圆", "YouYuan", "Microsoft YaHei";
+            font-size: 13px;
+            color: #FF69B4;
+        """)
+        self.happiness_layout.addWidget(self.happiness_pct_label, alignment=Qt.AlignCenter)
 
         self.energy_layout = QHBoxLayout()
         self.energy_layout.setContentsMargins(0, 0, 0, 0)
@@ -126,20 +173,28 @@ class DesktopPet(QWidget):
         self.energy_layout.addWidget(self.energy_label, alignment=Qt.AlignCenter)
         self.energy_bar = QProgressBar()
         self.energy_bar.setRange(0, 100)
-        self.energy_bar.setValue(80)
-        self.energy_bar.setFixedHeight(12)
+        self.energy_bar.setValue(self._init_energy)
+        self.energy_bar.setTextVisible(False)
+        self.energy_bar.setFixedHeight(16)
         self.energy_bar.setFixedWidth(150)
         self.energy_bar.setStyleSheet("""
             QProgressBar {
                 border: 1px solid #ccc;
-                border-radius: 5px;
-                text-align: center;
+                border-radius: 8px;
             }
             QProgressBar::chunk {
                 background-color: #1E90FF;
+                border-radius: 8px;
             }
         """)
         self.energy_layout.addWidget(self.energy_bar, alignment=Qt.AlignCenter)
+        self.energy_pct_label = QLabel(f"{self._init_energy}%")
+        self.energy_pct_label.setStyleSheet("""
+            font-family: "幼圆", "YouYuan", "Microsoft YaHei";
+            font-size: 13px;
+            color: #77cbf6;
+        """)
+        self.energy_layout.addWidget(self.energy_pct_label, alignment=Qt.AlignCenter)
         
         self.image = QLabel(self)
         self.image.setContentsMargins(0, 0, 0, 0)
@@ -155,9 +210,47 @@ class DesktopPet(QWidget):
         self.pet1 = []
         for filename in os.listdir("GIF"):
             self.pet1.append(os.path.join("GIF", filename))
-            
+        if not self._init_stats_visible:
+            self.stats_visible = True
+            self.hideStatsBar()
+        if self._init_is_dead:
+            self.working_timer.stop()
+            self.boring_timer.stop()
+            self.action_timer.stop()
+            self.status_timer.stop()
+            self.showing.setEnabled(False)
+            self.hidestats.setEnabled(False)
+            self.hideup.setEnabled(False)
+            self.hide()
+            self.resurrect_timer.start(self._init_resurrect_ms)
+
     def showMenu(self):
+        menu_style = """
+            QMenu {
+                background-color: #FFFAF9;
+                border: 1.5px solid #FF69B4;
+                padding: 5px 3px;
+                font-family: "幼圆", "YouYuan", "Microsoft YaHei";
+                font-size: 13px;
+                color: #555555;
+            }
+            QMenu::item {
+                padding: 6px 22px 6px 14px;
+                border-radius: 6px;
+                margin: 2px 4px;
+            }
+            QMenu::item:selected {
+                background-color: #FFE2DE;
+                color: #FF69B4;
+            }
+            QMenu::separator {
+                height: 1px;
+                background-color: #FFD6E7;
+                margin: 4px 8px;
+            }
+        """
         menu = QMenu()
+        menu.setStyleSheet(menu_style)
         menu.addAction(u"贴贴", self.stick)
         menu.addAction(u"拍一拍", self.call)
         menu.addAction(u"锻炼", self.exercise)
@@ -167,6 +260,18 @@ class DesktopPet(QWidget):
         menu.addAction(u"鸡毛丸子", self.baji2)
         menu.addAction(u"随机出现", self.appear)
         menu.addAction(u"遛小鸡毛", self.walkDog)
+        menu.addSeparator()
+        status_menu = menu.addMenu(u"状态切换")
+        status_menu.addAction(u"显示", self.showup)
+        status_menu.addAction(u"隐藏", self.hide)
+        status_menu.addAction(u"显示/隐藏状态栏", self.hideStatsBar)
+        autostart_action = QAction(u"开机自启动", menu)
+        autostart_action.setCheckable(True)
+        autostart_action.setChecked(self.is_autostart_enabled())
+        autostart_action.triggered.connect(self.toggleAutostart)
+        status_menu.addAction(autostart_action)
+        status_menu.addSeparator()
+        status_menu.addAction(u"关闭应用", self.quit)
         right_pos = self.mapToGlobal(self.rect().topRight())
         menu.exec_(right_pos)
 
@@ -338,6 +443,7 @@ class DesktopPet(QWidget):
         if self.is_dead:
             return
         self.is_dead = True
+        self.death_time = datetime.datetime.now()
         self.working_timer.stop()
         self.boring_timer.stop()
         self.action_timer.stop()
@@ -351,7 +457,9 @@ class DesktopPet(QWidget):
     def resurrectPet(self):
         self.is_dead = False
         self.happiness_bar.setValue(30)
+        self.happiness_pct_label.setText("30%")
         self.energy_bar.setValue(30)
+        self.energy_pct_label.setText("30%")
         self.showing.setEnabled(True)
         self.hidestats.setEnabled(True)
         self.hideup.setEnabled(True)
@@ -418,11 +526,13 @@ class DesktopPet(QWidget):
         current_value = self.happiness_bar.value()
         new_value = max(0, min(100, current_value + value))
         self.happiness_bar.setValue(new_value)
-        
+        self.happiness_pct_label.setText(f"{new_value}%")
+
     def updateEnergy(self, value):
         current_value = self.energy_bar.value()
         new_value = max(0, min(100, current_value + value))
         self.energy_bar.setValue(new_value)
+        self.energy_pct_label.setText(f"{new_value}%")
         
     def hideStatsBar(self):
         if self.is_dead:
@@ -430,8 +540,10 @@ class DesktopPet(QWidget):
         self.stats_visible = not self.stats_visible
         self.happiness_icon.setVisible(self.stats_visible)
         self.happiness_bar.setVisible(self.stats_visible)
+        self.happiness_pct_label.setVisible(self.stats_visible)
         self.energy_label.setVisible(self.stats_visible)
         self.energy_bar.setVisible(self.stats_visible)
+        self.energy_pct_label.setVisible(self.stats_visible)
         
     def updateDialogPosition(self):
         screen = QDesktopWidget().screenGeometry()
@@ -451,7 +563,78 @@ class DesktopPet(QWidget):
             y = 0
         return QPoint(x, y)
         
+    def load_state(self):
+        try:
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+            happiness = state.get('happiness', 80)
+            energy = state.get('energy', 80)
+            is_dead = state.get('is_dead', False)
+            death_time_str = state.get('death_time')
+            stats_visible = state.get('stats_visible', True)
+            remaining_ms = 0
+            if is_dead and death_time_str:
+                death_time = datetime.datetime.fromisoformat(death_time_str)
+                elapsed = (datetime.datetime.now() - death_time).total_seconds()
+                if elapsed >= 30 * 60:
+                    is_dead = False
+                    happiness = 30
+                    energy = 30
+                else:
+                    remaining_ms = int((30 * 60 - elapsed) * 1000)
+            return happiness, energy, is_dead, remaining_ms, stats_visible
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            return 80, 80, False, 0, True
+
+    def save_state(self):
+        state = {
+            'happiness': self.happiness_bar.value(),
+            'energy': self.energy_bar.value(),
+            'is_dead': self.is_dead,
+            'death_time': self.death_time.isoformat() if self.is_dead and hasattr(self, 'death_time') else None,
+            'stats_visible': self.stats_visible,
+        }
+        with open(STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False)
+
+    def is_autostart_enabled(self):
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                 r'Software\Microsoft\Windows\CurrentVersion\Run',
+                                 0, winreg.KEY_READ)
+            winreg.QueryValueEx(key, APP_NAME)
+            winreg.CloseKey(key)
+            return True
+        except (FileNotFoundError, OSError):
+            return False
+
+    def set_autostart(self, enabled):
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r'Software\Microsoft\Windows\CurrentVersion\Run',
+                             0, winreg.KEY_WRITE)
+        if enabled:
+            script = os.path.abspath(__file__)
+            python = sys.executable
+            if python.lower().endswith('python.exe'):
+                pythonw = python[:-len('python.exe')] + 'pythonw.exe'
+                if os.path.exists(pythonw):
+                    python = pythonw
+            cmd = f'"{python}" "{script}"'
+            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, cmd)
+        else:
+            try:
+                winreg.DeleteValue(key, APP_NAME)
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+
+    def toggleAutostart(self):
+        self.set_autostart(not self.is_autostart_enabled())
+        if hasattr(self, 'autostart_action'):
+            self.autostart_action.setChecked(self.is_autostart_enabled())
+
     def quit(self):
+        self.save_state()
         self.close()
         sys.exit()
         
@@ -462,6 +645,7 @@ class DesktopPet(QWidget):
         self.setWindowOpacity(0)
 
 if __name__ == '__main__':
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
     app = QApplication(sys.argv)
     pet = DesktopPet()
     sys.exit(app.exec_())
